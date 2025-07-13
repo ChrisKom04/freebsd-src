@@ -49,12 +49,15 @@
 #define	LONGOPT_SCHEMES		0x01000002
 #define	LONGOPT_VERSION		0x01000003
 #define	LONGOPT_CAPACITY	0x01000004
+#define LONGOPT_COMPRESSION	0x00100005
+
 
 static struct option longopts[] = {
 	{ "formats", no_argument, NULL, LONGOPT_FORMATS },
 	{ "schemes", no_argument, NULL, LONGOPT_SCHEMES },
 	{ "version", no_argument, NULL, LONGOPT_VERSION },
 	{ "capacity", required_argument, NULL, LONGOPT_CAPACITY },
+	{ "compression", required_argument, NULL, LONGOPT_COMPRESSION },
 	{ NULL, 0, NULL, 0 }
 };
 
@@ -73,6 +76,8 @@ u_int nsecs = 1;
 u_int secsz = 512;
 u_int blksz = 0;
 uint32_t active_partition = 0;
+
+enum compression_type compression = COMPRESSION_NONE;
 
 static void
 print_formats(int usage)
@@ -147,6 +152,7 @@ usage(const char *why)
 	fprintf(stderr, "\t--formats\t-  list image formats\n");
 	fprintf(stderr, "\t--schemes\t-  list partition schemes\n");
 	fprintf(stderr, "\t--version\t-  show version information\n");
+	fprintf(stderr, "\t--compression\t-  set compression method\n");
 	fputc('\n', stderr);
 	fprintf(stderr, "\t-a <num>\t-  mark num'th partition as active\n");
 	fprintf(stderr, "\t-b <file>\t-  file containing boot code\n");
@@ -661,6 +667,16 @@ main(int argc, char *argv[])
 				errc(EX_DATAERR, error, "capacity in bytes");
 			max_capacity = min_capacity;
 			break;
+		case LONGOPT_COMPRESSION:
+			if (compression != COMPRESSION_NONE)
+				usage("multiple compression options given");
+			if (strcmp(optarg, "zlib") == 0)
+				compression = QCOW_ZLIB;
+			else if (strcmp(optarg, "zstd") == 0)
+				compression = QCOW_ZSTD;
+			else
+				errx(EX_DATAERR, "unknown compression type");
+			break;
 		default:
 			usage("unknown option");
 		}
@@ -714,6 +730,9 @@ main(int argc, char *argv[])
 		    format_name);
 		fputc('\n', stderr);
 	}
+
+	if (compression != COMPRESSION_NONE && strcmp(format_name, "qcow2") != 0)
+		errx(EX_DATAERR, "compression is only supported for qcow2 format");
 
 #if defined(SPARSE_WRITE)
 	/*

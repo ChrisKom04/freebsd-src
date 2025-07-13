@@ -3,6 +3,7 @@ mkimg_blksz_list="512 4096"
 mkimg_format_list="qcow qcow2 raw vhd vhdf vhdx vmdk"
 mkimg_geom_list="1x1 63x255"
 mkimg_scheme_list="apm bsd ebr gpt mbr"
+mkimg_compression_list="zlib zstd"
 
 bootcode()
 {
@@ -35,8 +36,9 @@ makeimage()
 	scheme=$2
 	blksz=$3
 	geom=$4
-	pfx=$5
-	shift 5
+	compression=$5
+	pfx=$6
+	shift 6
 
 	nsecs=${geom%x*}
 	nhds=${geom#*x}
@@ -59,10 +61,16 @@ makeimage()
 		partarg="$ufs $swap"
 	fi
 
-	imagename=$pfx-$geom-$blksz-$scheme.$format
+	if test $compression = "none"; then
+		imagename=$pfx-$geom-$blksz-$scheme.$format
+		mkimg -y -f $format -o $imagename -s $scheme -P $blksz -H $nhds \
+			-T $nsecs $bootarg $partarg
+	else
+		imagename=$pfx-$geom-$blksz-$scheme-$compression.$format
+		mkimg -y -f $format -o $imagename -s $scheme -P $blksz -H $nhds \
+			-T $nsecs --compression $compression $bootarg $partarg
+	fi
 
-	mkimg -y -f $format -o $imagename -s $scheme -P $blksz -H $nhds \
-		-T $nsecs $bootarg $partarg
 	echo $imagename
 	return 0
 }
@@ -104,21 +112,27 @@ mkimg_test()
 
 	case $scheme in
 	ebr|mbr)
-		bsd=`makeimage raw bsd $blksz $geom _tmp`
+		bsd=`makeimage raw bsd $blksz $geom none _tmp`
 		partinfo="freebsd:=$bsd"
 		;;
 	*)
 		partinfo=""
 		;;
 	esac
-	image=`makeimage $format $scheme $blksz $geom img $partinfo`
+	image=`makeimage $format $scheme $blksz $geom none img $partinfo`
 	result=$image.out
 	hexdump -C $image > $result
 	if test "x$mkimg_update_baseline" = "xyes"; then
 		mkimg_rebase $image $result
-	else
-		baseline=`atf_get_srcdir`/$image
-		atf_check -s exit:0 diff -u $baseline $result
+		return 0
+	fi
+	baseline=`atf_get_srcdir`/$image
+	atf_check -s exit:0 diff -u $baseline $result
+	if test $format = "qcow2"; then
+		for C in $mkimg_compression_list; do
+			comp_img=`makeimage $format $scheme $blksz $geom $C img $partinfo`
+			atf_check -s exit:0 qemu-img compare -q $comp_img $image
+		done
 	fi
 	return 0
 }

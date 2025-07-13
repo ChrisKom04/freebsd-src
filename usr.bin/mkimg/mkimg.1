@@ -39,6 +39,7 @@
 .Op Fl C Ar max_capacity
 .Op Fl -capacity Ar capacity
 .Op Fl f Ar format
+.Op Fl -compression Ar method
 .Op Fl o Ar outfile
 .Op Fl a Ar active
 .Op Fl v
@@ -172,6 +173,17 @@ partition's
 .Xr geom 8
 name.
 No partitions are marked active when the value is 0.
+.Pp
+The
+.Fl -compression
+option can be used to compress the image's blocks, reducing the overall
+size of the produced file. This option is only
+supported for the
+.Ar qcow2
+image format. The available compression methods are
+.Ar zlib
+and
+.Ar zstd .
 .Pp
 A set of long options exist to query about the
 .Nm
