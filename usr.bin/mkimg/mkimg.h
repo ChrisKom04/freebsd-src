@@ -30,6 +30,12 @@
 #include <sys/queue.h>
 #include <sys/types.h>
 
+enum compression_type {
+	COMPRESSION_NONE,
+	QCOW_ZLIB,
+	QCOW_ZSTD
+};
+
 struct part {
 	TAILQ_ENTRY(part) link;
 	char	*alias;		/* Partition type alias. */
@@ -58,6 +64,8 @@ extern u_int nsecs;
 extern u_int secsz;	/* Logical block size. */
 extern u_int blksz;	/* Physical block size. */
 extern uint32_t active_partition;
+
+extern enum compression_type compression;
 
 static inline lba_t
 round_block(lba_t n)
