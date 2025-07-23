@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <zlib.h>
 
 #include "endian.h"
 #include "image.h"
@@ -83,19 +84,39 @@ struct qcow_info {
 	uint64_t	nclstrs;
 	uint64_t	ofsflags;
 
-	uint		l1clno;
-	uint		l2clno;
-	uint		rcclno;
+	uint64_t	rcblk_clno;
+	uint64_t	data_clno;
+	u_int		l1clno;
+	u_int		l2clno;
+	u_int		rcclno;
+
+	uLong	bound;
 };
 
 static u_int clstr_log2sz;
+
+#ifdef Z_SOLO
+static voidpf
+zlib_alloc(voidpf opaque, unsigned items, unsigned size)
+{
+	(void)opaque;
+	return (calloc(items, size));
+}
+
+static void
+zlib_free(voidpf opaque, voidpf address)
+{
+	(void)opaque;
+	free(address);
+}
+#endif
 
 static uint64_t
 round_clstr(uint64_t ofs)
 {
 	uint64_t clstrsz;
 
-	clstrsz = 1UL << clstr_log2sz;
+	clstrsz = 1ULL << clstr_log2sz;
 	return ((ofs + clstrsz - 1) & ~(clstrsz - 1));
 }
 
@@ -119,7 +140,7 @@ qcow_resize(lba_t imgsz, u_int version)
 
 	if (verbose)
 		fprintf(stderr, "QCOW: image size = %ju, cluster size = %u\n",
-		    (uintmax_t)imagesz, (u_int)(1U << clstr_log2sz));
+	  (uintmax_t)imagesz, (u_int)(1ULL << clstr_log2sz));
 
 	return (image_set_size(imagesz / secsz));
 }
@@ -139,19 +160,21 @@ qcow2_resize(lba_t imgsz)
 }
 
 static struct qcow_info *
-qcow_init(uint version)
+qcow_init(u_int version)
 {
+	z_stream stream;
+	struct qcow_info *info;
 	uint64_t imagesz, nclstrs, clstr_rcblks, clstr_rctblsz, n;
 	lba_t blk_imgsz;
-	struct qcow_info *info;
+	int ret;
 
 	info = calloc(1, sizeof(struct qcow_info));
 	if (info == NULL)
-		return NULL;
-	
+		return (NULL);
+
 	blk_imgsz = image_get_size();
 	imagesz = blk_imgsz * secsz;
-	info->clstr_imgsz =  imagesz >> clstr_log2sz;
+	info->clstr_imgsz = imagesz >> clstr_log2sz;
 	info->clstr_l2tblsz = round_clstr(info->clstr_imgsz * 8) >> clstr_log2sz;
 	info->clstr_l1tblsz = round_clstr(info->clstr_l2tblsz * 8) >> clstr_log2sz;
 
@@ -161,7 +184,29 @@ qcow_init(uint version)
 		info->l2clno = info->l1clno + info->clstr_l1tblsz;
 		break;
 	case QCOW_VERSION_2:
-		nclstrs = info->clstr_imgsz + info->clstr_l2tblsz + info->clstr_l1tblsz + 1;
+		if (compression == QCOW_ZLIB) {
+			memset(&stream, 0, sizeof(z_stream));
+			#ifdef Z_SOLO
+			stream.zalloc = zlib_alloc;
+			stream.zfree = zlib_free;
+			#endif
+
+			ret = deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY);
+			if (ret != Z_OK) {
+				errno = ret == Z_MEM_ERROR ? ENOMEM : (ret == Z_STREAM_ERROR ? EINVAL : EPROTO);
+				free(info);
+				return (NULL);
+			}
+
+			info->bound = deflateBound(&stream, 1ULL << clstr_log2sz);
+			/* If the compressed cluster descriptor's field can be overflown adjust the bound so that the cluster can be saved uncompressed. */
+			if (info->bound >= ((1ULL << (clstr_log2sz - 8)) - 1) * 512 + 2 && info->bound < 1.5 * (1ULL << clstr_log2sz))
+				info->bound = 1.5 * (1ULL << clstr_log2sz);
+			deflateEnd(&stream);
+		}
+
+		nclstrs = (compression == QCOW_ZLIB ? (info->clstr_imgsz * info->bound) / (1ULL << clstr_log2sz) + 1 : info->clstr_imgsz)
+			+ info->clstr_l2tblsz + info->clstr_l1tblsz + 1;
 		clstr_rcblks = clstr_rctblsz = 0;
 		do {
 			n = clstr_rcblks + clstr_rctblsz;
@@ -176,17 +221,17 @@ qcow_init(uint version)
 		info->nclstrs = 1 + info->clstr_l1tblsz + info->clstr_rctblsz;
 	}
 
-	return info;
+	return (info);
 }
 
 static int
-qcow_header(int fd, uint version, struct qcow_info *info)
+qcow_header(int fd, u_int version, struct qcow_info *info)
 {
-	int error;
 	struct qcow_header *hdr;
+	int error;
 
 	error = 0;
-	hdr = calloc(1, (1U << clstr_log2sz));
+	hdr = calloc(1, (1ULL << clstr_log2sz));
 	if (hdr == NULL)
 		return (errno);
 
@@ -197,20 +242,20 @@ qcow_header(int fd, uint version, struct qcow_info *info)
 	case QCOW_VERSION_1:
 		hdr->u.v1.clstr_log2sz = clstr_log2sz;
 		hdr->u.v1.l2_log2sz = clstr_log2sz - 3;
-		be64enc(&hdr->u.v1.l1_offset, (1U << clstr_log2sz) * info->l1clno);
+		be64enc(&hdr->u.v1.l1_offset, (1ULL << clstr_log2sz) * info->l1clno);
 		break;
 	case QCOW_VERSION_2:
 		be32enc(&hdr->clstr_log2sz, clstr_log2sz);
 		be32enc(&hdr->u.v2.l1_entries, info->clstr_l2tblsz);
-		be64enc(&hdr->u.v2.l1_offset, (1U << clstr_log2sz) * info->l1clno);
-		be64enc(&hdr->u.v2.refcnt_offset, (1U << clstr_log2sz) * info->rcclno);
+		be64enc(&hdr->u.v2.l1_offset, (1ULL << clstr_log2sz) * info->l1clno);
+		be64enc(&hdr->u.v2.refcnt_offset, (1ULL << clstr_log2sz) * info->rcclno);
 		be32enc(&hdr->u.v2.refcnt_clstrs, info->clstr_rctblsz);
 		break;
 	default:
 		assert(0);
 	}
 
-	if (sparse_write(fd, hdr, 1U << clstr_log2sz) < 0) 
+	if (sparse_write(fd, hdr, 1ULL << clstr_log2sz) < 0)
 		error = errno;
 
 	free(hdr);
@@ -221,13 +266,13 @@ static int
 qcow_l1table(int fd, struct qcow_info *info, uint64_t *ofs, uint64_t **tbl)
 {
 	uint64_t *l1tbl;
-	uint64_t n, reps;
-	uint64_t blk;
-	uint blk_clstrsz, l1idx;
+	uint64_t blk, n, nclstrs, reps;
+	u_int blk_clstrsz, l1idx;
 	int error;
 
-	blk_clstrsz = (1U << clstr_log2sz) / secsz;
-	l1tbl = calloc(info->clstr_l1tblsz, 1U << clstr_log2sz);
+	nclstrs = 0;
+	blk_clstrsz = (1ULL << clstr_log2sz) / secsz;
+	l1tbl = calloc(info->clstr_l1tblsz, 1ULL << clstr_log2sz);
 	if (l1tbl == NULL)
 		return (ENOMEM);
 
@@ -235,18 +280,20 @@ qcow_l1table(int fd, struct qcow_info *info, uint64_t *ofs, uint64_t **tbl)
 	for (n = 0; n < reps; n++) {
 		blk = n * blk_clstrsz;
 		if (image_data(blk, blk_clstrsz)) {
-			info->nclstrs++;
+			nclstrs++;
 			l1idx = n >> (clstr_log2sz - 3);
 			if (l1tbl[l1idx] == 0) {
 				be64enc(l1tbl + l1idx, *ofs + info->ofsflags);
-				*ofs += (1U << clstr_log2sz);
+				*ofs += (1ULL << clstr_log2sz);
 				info->nclstrs++;
 			}
 		}
 	}
+	info->nclstrs += compression == QCOW_ZLIB ? (nclstrs * info->bound) / (1ULL << clstr_log2sz) + 1 : nclstrs;
+	info->rcblk_clno = *ofs >> clstr_log2sz;
 
 	error = 0;
-	if (sparse_write(fd, l1tbl, (1U << clstr_log2sz) * info->clstr_l1tblsz) < 0)
+	if (sparse_write(fd, l1tbl, (1ULL << clstr_log2sz) * info->clstr_l1tblsz) < 0)
 		error = errno;
 
 	*tbl = l1tbl;
@@ -254,8 +301,9 @@ qcow_l1table(int fd, struct qcow_info *info, uint64_t *ofs, uint64_t **tbl)
 }
 
 static void
-qcow_rcblks_calc(struct qcow_info *info) {
-	uint64_t n, clstr_rcblks;
+qcow_rcblks_calc(struct qcow_info *info)
+{
+	uint64_t clstr_rcblks, n;
 
 	clstr_rcblks = 0;
 	do {
@@ -276,16 +324,16 @@ qcow_rctbl(int fd, struct qcow_info *info, uint64_t *ofs)
 
 	error = 0;
 	reps = info->clstr_rcblks;
-	rctbl = calloc(info->clstr_rctblsz, 1 << clstr_log2sz);
+	rctbl = calloc(info->clstr_rctblsz, 1ULL << clstr_log2sz);
 	if (rctbl == NULL)
 		return (errno);
 
 	for (n = 0; n < reps; n++) {
 		be64enc(rctbl + n, *ofs);
-		*ofs += (1 << clstr_log2sz);
+		*ofs += (1ULL << clstr_log2sz);
 		info->nclstrs++;
 	}
-	if (sparse_write(fd, rctbl, info->clstr_rctblsz * (1 << clstr_log2sz)) < 0)
+	if (sparse_write(fd, rctbl, info->clstr_rctblsz * (1ULL << clstr_log2sz)) < 0)
 		error = errno;
 
 	free(rctbl);
@@ -293,35 +341,36 @@ qcow_rctbl(int fd, struct qcow_info *info, uint64_t *ofs)
 }
 
 static int
-qcow_l2tbl(int fd, struct qcow_info *info, uint64_t *l1tbl, uint64_t *ofs) {
+qcow_l2tbl(int fd, struct qcow_info *info, uint64_t *l1tbl, uint64_t *ofs)
+{
 	uint64_t *l2tbl;
 	uint64_t l1idx, l2idx;
 	lba_t blk, blkofs, blk_imgsz;
-	uint blk_clstrsz;
+	u_int blk_clstrsz;
 	int error;
 
 	error = 0;
-	blk_clstrsz = (1 << clstr_log2sz) / secsz;
+	blk_clstrsz = (1ULL << clstr_log2sz) / secsz;
 	blk_imgsz = info->clstr_imgsz * blk_clstrsz;
-	l2tbl = malloc(1 << clstr_log2sz);
+	l2tbl = malloc(1ULL << clstr_log2sz);
 	if (l2tbl == NULL)
-		return ENOMEM;
+		return (ENOMEM);
 
 	for (l1idx = 0; l1idx < info->clstr_l2tblsz; l1idx++) {
 		if (l1tbl[l1idx] == 0)
 			continue;
-		memset(l2tbl, 0, 1 << clstr_log2sz);
+		memset(l2tbl, 0, 1ULL << clstr_log2sz);
 		blkofs = (lba_t)l1idx * blk_clstrsz << (clstr_log2sz - 3);
-		for (l2idx = 0; l2idx < (1U << (clstr_log2sz - 3)); l2idx++) {
+		for (l2idx = 0; l2idx < (1ULL << (clstr_log2sz - 3)); l2idx++) {
 			blk = blkofs + (lba_t)l2idx * blk_clstrsz;
 			if (blk >= blk_imgsz)
 				break;
 			if (image_data(blk, blk_clstrsz)) {
-				be64enc(l2tbl + l2idx, *ofs + info->ofsflags);
-				*ofs += (1U << clstr_log2sz);
+				be64enc(l2tbl + l2idx, compression == QCOW_ZLIB ? 0 : *ofs + info->ofsflags);
+				*ofs += (1ULL << clstr_log2sz);
 			}
 		}
-		if (sparse_write(fd, l2tbl, (1U << clstr_log2sz)) < 0) {
+		if (sparse_write(fd, l2tbl, (1ULL << clstr_log2sz)) < 0) {
 			error = errno;
 			break;
 		}
@@ -339,13 +388,13 @@ qcow_rcblks(int fd, struct qcow_info *info)
 	int error;
 
 	error = 0;
-	rcblk = calloc(info->clstr_rcblks, 1 << clstr_log2sz);
+	rcblk = calloc(info->clstr_rcblks, 1ULL << clstr_log2sz);
 	if (rcblk == NULL)
 		return (ENOMEM);
 
 	for (n = 0; n < info->nclstrs; n++)
-		be16enc(rcblk + n, 1);
-	if (sparse_write(fd, rcblk, (1U << clstr_log2sz) * info->clstr_rcblks) < 0) 
+		be16enc(rcblk + n, compression == QCOW_ZLIB ? n < info->data_clno : 1);
+	if (sparse_write(fd, rcblk, (1ULL << clstr_log2sz) * info->clstr_rcblks) < 0)
 		error = errno;
 
 	free(rcblk);
@@ -353,14 +402,15 @@ qcow_rcblks(int fd, struct qcow_info *info)
 }
 
 static int
-qcow_copyout(int fd, struct qcow_info *info) {
+qcow_copyout(int fd, struct qcow_info *info)
+{
 	uint64_t n;
 	lba_t blk;
-	uint blk_clstrsz;
+	u_int blk_clstrsz;
 	int error;
 
 	error = 0;
-	blk_clstrsz = (1 << clstr_log2sz) / secsz;
+	blk_clstrsz = (1ULL << clstr_log2sz) / secsz;
 	for (n = 0; n < info->clstr_imgsz; n++) {
 		blk = n * blk_clstrsz;
 		if (image_data(blk, blk_clstrsz)) {
@@ -376,12 +426,182 @@ qcow_copyout(int fd, struct qcow_info *info) {
 }
 
 static int
-qcow_write(int fd, uint version)
+qcow_copyout_cmprss(int fd, struct qcow_info *info)
+{
+	z_stream stream;
+	char *data_buf, *comp_buf, *zero_buf;
+	uint64_t *l2tbl;
+	uint16_t *rcblk, *ptr;
+	uint64_t clstrsz, clstr, descriptor, n;
+	uint64_t ofs, rcblk_ofs, l2_ofs;
+	uint64_t extra_sec, out_len;
+	lba_t blk, blk_clstrsz;
+	int error, flag, ret, x;
+
+	flag = 0;
+	error = 0;
+	clstrsz = 1ULL << clstr_log2sz;
+	blk_clstrsz = clstrsz / secsz;
+	rcblk_ofs = info->rcblk_clno * clstrsz + info->data_clno * 2;
+	l2_ofs = info->l2clno * clstrsz;
+	ofs = info->data_clno << clstr_log2sz;
+
+	l2tbl = NULL;
+	rcblk = NULL;
+	data_buf = comp_buf = NULL;
+	l2tbl = malloc(clstrsz);
+	rcblk = calloc(1, clstrsz);
+	data_buf = malloc(clstrsz);
+	comp_buf = malloc(info->bound);
+	zero_buf = calloc(1, clstrsz);
+
+	if (l2tbl == NULL || rcblk == NULL || data_buf == NULL || comp_buf == NULL || zero_buf == NULL) {
+		error = ENOMEM;
+		goto out;
+	}
+
+	for (n = 0; n < info->clstr_imgsz; n++) {
+		blk = n * blk_clstrsz;
+		if (image_data(blk, blk_clstrsz)) {
+			flag = 1;
+			error = image_buffer_region(data_buf, blk, blk_clstrsz);
+			if (error)
+				break;
+
+			memset(&stream, 0, sizeof(z_stream));
+			#ifdef Z_SOLO
+			stream.zalloc = zlib_alloc;
+			stream.zfree = zlib_free;
+			#endif
+
+			stream.next_in = (Bytef *)data_buf;
+			stream.avail_in = clstrsz;
+			stream.next_out = (Bytef *)comp_buf;
+			stream.avail_out = info->bound;
+
+			ret = deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY);
+			if (ret < 0) {
+				error = ret == Z_MEM_ERROR ? ENOMEM : (ret == Z_STREAM_ERROR ? EINVAL : EPROTO);
+				goto out;
+			}
+
+			if (deflate(&stream, Z_FINISH) != Z_STREAM_END) {
+				error = EIO;
+				goto out;
+			}
+			deflateEnd(&stream);
+
+			extra_sec = (ofs + stream.total_out - 1) / secsz - ofs / secsz;
+			x = 62 - clstr_log2sz + 8;
+			if (extra_sec >= (1ULL << (62 - x))) {
+				out_len = clstrsz;
+
+				if (ofs % clstrsz != 0) {
+					if (sparse_write(fd, zero_buf, clstrsz - ofs % clstrsz) < 0) {
+						error = errno;
+						goto out;
+					}
+					ofs += clstrsz - ofs % clstrsz;
+				}
+
+				if (sparse_write(fd, data_buf, clstrsz) < 0) {
+					error = errno;
+					goto out;
+				}
+
+				be64enc(l2tbl++, ofs + QCOW_CLSTR_COPIED);
+			}else {
+				out_len = stream.total_out;
+				descriptor = (ofs & ((1ULL << (x > 56 ? 56 : x)) - 1))
+					| (extra_sec << x)
+					| QCOW_CLSTR_COMPRESSED;
+				be64enc(l2tbl++, descriptor);
+
+				if (sparse_write(fd, comp_buf, out_len) < 0) {
+					error = errno;
+					goto out;
+				}
+			}
+
+			for (clstr = ofs / clstrsz; clstr <= (ofs + out_len - 1) / clstrsz; clstr++) {
+				if ((clstr - info->data_clno) % (clstrsz / 2) == 0 && (info->rcblk_clno * clstrsz) + clstr * 2 == rcblk_ofs + clstrsz) {
+					if (lseek(fd, rcblk_ofs, SEEK_SET) < 0 || sparse_write(fd, rcblk, clstrsz) < 0) {
+						error = errno;
+						goto out;
+					}
+					memset(rcblk, 0, clstrsz);
+					rcblk_ofs += clstrsz;
+				}
+				ptr = rcblk + (clstr - info->data_clno) % (clstrsz / 2);
+				be16enc(ptr, be16dec(ptr) + 1);
+			}
+
+			ofs += out_len;
+			lseek(fd, ofs, SEEK_SET);
+		} else {
+			be64enc(l2tbl++, 0);
+		}
+
+		if ((n + 1) % (clstrsz / 8) == 0) {
+			l2tbl -= clstrsz / 8;
+			if (flag) {
+				if (lseek(fd, l2_ofs, SEEK_SET) < 0 || sparse_write(fd, l2tbl, clstrsz) < 0 || lseek(fd, ofs, SEEK_SET) < 0) {
+					error = errno;
+					goto out;
+				}
+				l2_ofs += clstrsz;
+			}
+			flag = 0;
+		}
+	}
+
+	if (n % (clstrsz / 8) != 0) {
+		l2tbl -= n % (clstrsz / 8);
+		if (flag) {
+			if (lseek(fd, l2_ofs, SEEK_SET) < 0 || sparse_write(fd, l2tbl, (n * 8) % clstrsz) < 0 || lseek(fd, ofs, SEEK_SET) < 0) {
+				error = errno;
+				goto out;
+			}
+		}
+	}
+
+	if (info->clstr_imgsz != 0) {
+		if(lseek(fd, rcblk_ofs, SEEK_SET) < 0 ||
+			sparse_write(fd, rcblk, ((ofs / clstrsz - info->data_clno) % (clstrsz / 2) + 1) * 2) < 0 ||
+			lseek(fd, ofs, SEEK_SET) < 0) {
+			error = errno;
+			goto out;
+		}
+	}
+
+out:
+	if (l2tbl != NULL)
+		free(l2tbl);
+	if (rcblk != NULL)
+		free(rcblk);
+	if (data_buf != NULL)
+		free(data_buf);
+	if (comp_buf != NULL)
+		free(comp_buf);
+	if (zero_buf != NULL)
+		free(zero_buf);
+
+	if (ofs % clstrsz != 0 && sparse_write(fd, zero_buf, clstrsz - ofs % clstrsz) < 0)
+		error = errno;
+
+	if (!error)
+		image_copyout_done(fd);
+
+	return (error);
+}
+
+static int
+qcow_write(int fd, u_int version)
 {
 	struct qcow_info *info;
 	uint64_t *l1tbl;
 	uint64_t ofs;
-	uint error;
+	u_int error;
 
 	l1tbl = NULL;
 	info = qcow_init(version);
@@ -394,7 +614,7 @@ qcow_write(int fd, uint version)
 	if (error)
 		goto out;
 
-	ofs = info->l2clno * (1U << clstr_log2sz);
+	ofs = info->l2clno * (1ULL << clstr_log2sz);
 	error = qcow_l1table(fd, info, &ofs, &l1tbl);
 	if (error)
 		goto out;
@@ -404,6 +624,8 @@ qcow_write(int fd, uint version)
 		error = qcow_rctbl(fd, info, &ofs);
 		if (error)
 			goto out;
+
+		info->data_clno = ofs >> clstr_log2sz;
 	}
 
 	error = qcow_l2tbl(fd, info, l1tbl, &ofs);
@@ -415,11 +637,12 @@ qcow_write(int fd, uint version)
 
 	if (version != QCOW_VERSION_1) {
 		error = qcow_rcblks(fd, info);
+		ofs += info->clstr_rcblks * (1ULL << clstr_log2sz);
 		if (error)
 			goto out;
 	}
 
-	error = qcow_copyout(fd, info);
+	error = compression == QCOW_ZLIB ? qcow_copyout_cmprss(fd, info) : qcow_copyout(fd, info);
 
 out:
 	if (info != NULL)
