@@ -50,7 +50,7 @@ struct qcow_header {
 #define	QCOW_MAGIC		0x514649fb
 	uint32_t	version;
 #define	QCOW_VERSION_1		1
-#define	QCOW_VERSION_2		2
+#define	QCOW_VERSION_2		3
 	uint64_t	path_offset;
 	uint32_t	path_length;
 	uint32_t	clstr_log2sz;	/* v2 only */
@@ -71,6 +71,12 @@ struct qcow_header {
 			uint32_t	refcnt_clstrs;
 			uint32_t	snapshot_count;
 			uint64_t	snapshot_offset;
+			uint64_t	incompatible_features;
+			uint64_t	compatible_features;
+			uint64_t	autoclear_features;
+			uint32_t	refcnt_order;
+			uint32_t	header_length;
+			uint8_t		additional_fields[8];
 		} v2;
 	} u;
 };
@@ -250,6 +256,12 @@ qcow_header(int fd, u_int version, struct qcow_info *info)
 		be64enc(&hdr->u.v2.l1_offset, (1ULL << clstr_log2sz) * info->l1clno);
 		be64enc(&hdr->u.v2.refcnt_offset, (1ULL << clstr_log2sz) * info->rcclno);
 		be32enc(&hdr->u.v2.refcnt_clstrs, info->clstr_rctblsz);
+		be32enc(&hdr->u.v2.refcnt_order, 4);
+		be32enc(&hdr->u.v2.header_length, 112);
+		if (compression == QCOW_ZSTD) {
+			be64enc(&hdr->u.v2.incompatible_features, (1ULL << 3));
+			hdr->u.v2.additional_fields[0] = 1;
+		}
 		break;
 	default:
 		assert(0);
