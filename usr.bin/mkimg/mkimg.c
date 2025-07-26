@@ -671,7 +671,7 @@ main(int argc, char *argv[])
 				usage("multiple compression options given");
 			if (strcmp(optarg, "zlib") == 0)
 				compression = QCOW_ZLIB;
-			else if (strcmp(optarg, "ztsd") == 0)
+			else if (strcmp(optarg, "zstd") == 0)
 				compression = QCOW_ZSTD;
 			else
 				errx(EX_DATAERR, "unknown compression type");
