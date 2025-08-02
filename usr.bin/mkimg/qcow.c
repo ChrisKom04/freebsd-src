@@ -31,6 +31,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
+#include <zstd.h>
+#include <zstd_errors.h>
 
 #include "endian.h"
 #include "image.h"
@@ -204,11 +206,16 @@ qcow_init(u_int version)
 				return (NULL);
 			}
 
-			info->bound = deflateBound(&stream, 1ULL << clstr_log2sz);
+			info->bound = (uint64_t)deflateBound(&stream, 1ULL << clstr_log2sz);
+			deflateEnd(&stream);
+		} else if (compression == QCOW_ZSTD) {
+			info->bound = (uint64_t)ZSTD_compressBound(1ULL << clstr_log2sz);
+		}
+
+		if (compression != COMPRESSION_NONE) {
 			/* If the compressed cluster descriptor's field can be overflown adjust the bound so that the cluster can be saved uncompressed. */
 			if (info->bound >= ((1ULL << (clstr_log2sz - 8)) - 1) * 512 + 2 && info->bound < 1.5 * (1ULL << clstr_log2sz))
 				info->bound = 1.5 * (1ULL << clstr_log2sz);
-			deflateEnd(&stream);
 		}
 
 		nclstrs = (compression == QCOW_ZLIB ? (info->clstr_imgsz * info->bound) / (1ULL << clstr_log2sz) + 1 : info->clstr_imgsz)
@@ -438,17 +445,78 @@ qcow_copyout(int fd, struct qcow_info *info)
 }
 
 static int
+qcow_buffer_compress(char *data_buf, char *comp_buf, uint64_t *comp_size, struct qcow_info *info)
+{
+	int error;
+
+	error = 0;
+	if (compression == QCOW_ZLIB) {
+		z_stream stream;
+		int ret;
+
+		memset(&stream, 0, sizeof(z_stream));
+		#ifdef Z_SOLO
+		stream.zalloc = zlib_alloc;
+		stream.zfree = zlib_free;
+		#endif
+
+		stream.next_in = (Bytef *)data_buf;
+		stream.avail_in = (1ULL << clstr_log2sz);
+		stream.next_out = (Bytef *)comp_buf;
+		stream.avail_out = info->bound;
+
+		ret = deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY);
+		if (ret < 0) {
+			error = ret == Z_MEM_ERROR ? ENOMEM : (ret == Z_STREAM_ERROR ? EINVAL : EPROTO);
+			goto out;
+		}
+
+		if (deflate(&stream, Z_FINISH) != Z_STREAM_END) {
+			error = EIO;
+			goto out;
+		}
+
+		*comp_size = (uint64_t)stream.total_out;
+		deflateEnd(&stream);
+	} else if (compression == QCOW_ZSTD) {
+		ZSTD_ErrorCode code;
+		size_t ret;
+
+		ret = ZSTD_compress(comp_buf, info->bound, data_buf, 1ULL << clstr_log2sz, ZSTD_CLEVEL_DEFAULT);
+		if (ZSTD_isError(ret) != 0) {
+			code = ZSTD_getErrorCode(ret);
+			switch (code) {
+				case ZSTD_error_memory_allocation:
+					error = ENOMEM;
+					break;
+				case ZSTD_error_srcSize_wrong:
+				case ZSTD_error_dstSize_tooSmall:
+				case ZSTD_error_parameter_outOfBound:
+					error = EINVAL;
+				default:
+					error = EIO;
+			}
+			goto out;
+		}
+
+		*comp_size = (uint64_t)ret;
+	}
+
+out:
+	return (error);
+}
+
+static int
 qcow_copyout_cmprss(int fd, struct qcow_info *info)
 {
-	z_stream stream;
 	char *data_buf, *comp_buf, *zero_buf;
 	uint64_t *l2tbl;
 	uint16_t *rcblk, *ptr;
-	uint64_t clstrsz, clstr, descriptor, n;
-	uint64_t ofs, rcblk_ofs, l2_ofs;
+	uint64_t clstrsz, clstr, comp_size, descriptor;
+	uint64_t n, ofs, rcblk_ofs, l2_ofs;
 	uint64_t extra_sec, out_len;
 	lba_t blk, blk_clstrsz;
-	int error, flag, ret, x;
+	int error, flag, x;
 
 	flag = 0;
 	error = 0;
@@ -477,33 +545,14 @@ qcow_copyout_cmprss(int fd, struct qcow_info *info)
 		if (image_data(blk, blk_clstrsz)) {
 			flag = 1;
 			error = image_buffer_region(data_buf, blk, blk_clstrsz);
-			if (error)
-				break;
-
-			memset(&stream, 0, sizeof(z_stream));
-			#ifdef Z_SOLO
-			stream.zalloc = zlib_alloc;
-			stream.zfree = zlib_free;
-			#endif
-
-			stream.next_in = (Bytef *)data_buf;
-			stream.avail_in = clstrsz;
-			stream.next_out = (Bytef *)comp_buf;
-			stream.avail_out = info->bound;
-
-			ret = deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY);
-			if (ret < 0) {
-				error = ret == Z_MEM_ERROR ? ENOMEM : (ret == Z_STREAM_ERROR ? EINVAL : EPROTO);
+			if (error != 0)
 				goto out;
-			}
 
-			if (deflate(&stream, Z_FINISH) != Z_STREAM_END) {
-				error = EIO;
+			error = qcow_buffer_compress(data_buf, comp_buf, &comp_size, info);
+			if (error != 0)
 				goto out;
-			}
-			deflateEnd(&stream);
 
-			extra_sec = (ofs + stream.total_out - 1) / secsz - ofs / secsz;
+			extra_sec = (ofs + comp_size - 1) / secsz - ofs / secsz;
 			x = 62 - clstr_log2sz + 8;
 			if (extra_sec >= (1ULL << (62 - x))) {
 				out_len = clstrsz;
@@ -522,8 +571,8 @@ qcow_copyout_cmprss(int fd, struct qcow_info *info)
 				}
 
 				be64enc(l2tbl++, ofs + QCOW_CLSTR_COPIED);
-			}else {
-				out_len = stream.total_out;
+			} else {
+				out_len = comp_size;
 				descriptor = (ofs & ((1ULL << (x > 56 ? 56 : x)) - 1))
 					| (extra_sec << x)
 					| QCOW_CLSTR_COMPRESSED;
@@ -578,7 +627,7 @@ qcow_copyout_cmprss(int fd, struct qcow_info *info)
 	}
 
 	if (info->clstr_imgsz != 0) {
-		if(lseek(fd, rcblk_ofs, SEEK_SET) < 0 ||
+		if (lseek(fd, rcblk_ofs, SEEK_SET) < 0 ||
 			sparse_write(fd, rcblk, ((ofs / clstrsz - info->data_clno) % (clstrsz / 2) + 1) * 2) < 0 ||
 			lseek(fd, ofs, SEEK_SET) < 0) {
 			error = errno;
@@ -654,7 +703,7 @@ qcow_write(int fd, u_int version)
 			goto out;
 	}
 
-	error = compression == QCOW_ZLIB ? qcow_copyout_cmprss(fd, info) : qcow_copyout(fd, info);
+	error = compression == COMPRESSION_NONE ? qcow_copyout(fd, info) : qcow_copyout_cmprss(fd, info);
 
 out:
 	if (info != NULL)
