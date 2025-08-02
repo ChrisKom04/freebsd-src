@@ -554,7 +554,10 @@ qcow_copyout_cmprss(int fd, struct qcow_info *info)
 
 			extra_sec = (ofs + comp_size - 1) / secsz - ofs / secsz;
 			x = 62 - clstr_log2sz + 8;
-			if (extra_sec >= (1ULL << (62 - x))) {
+			descriptor = (ofs & ((1ULL << (x > 56 ? 56 : x)) - 1))
+				| (extra_sec << x)
+				| QCOW_CLSTR_COMPRESSED;
+			if (extra_sec >= (1ULL << (62 - x)) || (descriptor & ((1ULL << x) - 1)) != ofs) {
 				out_len = clstrsz;
 
 				if (ofs % clstrsz != 0) {
@@ -573,9 +576,6 @@ qcow_copyout_cmprss(int fd, struct qcow_info *info)
 				be64enc(l2tbl++, ofs + QCOW_CLSTR_COPIED);
 			} else {
 				out_len = comp_size;
-				descriptor = (ofs & ((1ULL << (x > 56 ? 56 : x)) - 1))
-					| (extra_sec << x)
-					| QCOW_CLSTR_COMPRESSED;
 				be64enc(l2tbl++, descriptor);
 
 				if (sparse_write(fd, comp_buf, out_len) < 0) {
