@@ -339,15 +339,27 @@ qcow_rcblks(int fd, struct qcow_info *info)
 	int error;
 
 	error = 0;
-	rcblk = calloc(info->clstr_rcblks, 1ULL << clstr_log2sz);
+	rcblk = calloc(1, 1ULL << clstr_log2sz);
 	if (rcblk == NULL)
 		return (ENOMEM);
 
-	for (n = 0; n < info->nclstrs; n++)
-		be16enc(rcblk + n, 1);
-	if (sparse_write(fd, rcblk, (1ULL << clstr_log2sz) * info->clstr_rcblks) < 0) 
-		error = errno;
+	for (n = 0; n < info->nclstrs; n++) {
+		be16enc(rcblk + n % (1ULL << (clstr_log2sz - 1)), 1);
+		if ((n + 1) % (1ULL << (clstr_log2sz - 1)) == 0) {
+			if (sparse_write(fd, rcblk, (1ULL << clstr_log2sz)) < 0) {
+				error = errno;
+				goto out;
+			}
+			memset(rcblk, 0, 1ULL << clstr_log2sz);
+		}
+	}
 
+	if (n % (1ULL << (clstr_log2sz - 1)) != 0) {
+		if (sparse_write(fd, rcblk, (1ULL << clstr_log2sz)) < 0)
+			error = errno;
+	}
+
+out:
 	free(rcblk);
 	return (error);
 }
