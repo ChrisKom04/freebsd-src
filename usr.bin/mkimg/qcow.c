@@ -635,6 +635,12 @@ qcow_copyout_cmprss(int fd, struct qcow_info *info)
 		}
 	}
 
+	if (ofs % clstrsz != 0 && sparse_write(fd, zero_buf, clstrsz - ofs % clstrsz) < 0)
+		error = errno;
+	
+	if (!error)
+		image_copyout_done(fd);
+
 out:
 	if (l2tbl != NULL)
 		free(l2tbl);
@@ -646,12 +652,6 @@ out:
 		free(comp_buf);
 	if (zero_buf != NULL)
 		free(zero_buf);
-
-	if (ofs % clstrsz != 0 && sparse_write(fd, zero_buf, clstrsz - ofs % clstrsz) < 0)
-		error = errno;
-
-	if (!error)
-		image_copyout_done(fd);
 
 	return (error);
 }
