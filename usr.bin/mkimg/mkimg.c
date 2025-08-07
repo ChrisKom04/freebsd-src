@@ -152,6 +152,7 @@ usage(const char *why)
 	fprintf(stderr, "\t--formats\t-  list image formats\n");
 	fprintf(stderr, "\t--schemes\t-  list partition schemes\n");
 	fprintf(stderr, "\t--version\t-  show version information\n");
+	fprintf(stderr, "\t--compression\t-  set compression method\n");
 	fputc('\n', stderr);
 	fprintf(stderr, "\t-a <num>\t-  mark num'th partition as active\n");
 	fprintf(stderr, "\t-b <file>\t-  file containing boot code\n");
