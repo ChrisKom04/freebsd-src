@@ -11,8 +11,6 @@ CFLAGS+=-DMKIMG_VERSION=${MKIMG_VERSION}
 CFLAGS+=-DSPARSE_WRITE
 CFLAGS+=-I${SRCTOP}/sys/sys/disk
 CFLAGS+=-I${SRCTOP}/sys/contrib/zstd/lib
-CFLAGS+=-lz
-LDADD+=-lzstd
 
 # List of formats to support
 SRCS+= \
@@ -32,7 +30,7 @@ SRCS+=	\
 
 BINDIR?=/usr/bin
 
-LIBADD=	util
+LIBADD=	util z zstd
 
 HAS_TESTS=
 SUBDIR.${MK_TESTS}+= tests
